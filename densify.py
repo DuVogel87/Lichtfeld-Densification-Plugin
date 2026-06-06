@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -113,6 +114,7 @@ def _build_camera_records_from_colmap(
                 t=t,
                 P=P,
                 C=C,
+                colmap_camera=cam,
             )
         )
     return records, img_ids
@@ -533,6 +535,34 @@ def build_argparser():
     return ap
 
 
+def _cli_progress_callback() -> Callable[[float, str], None]:
+    last = {"pct": None, "msg": None, "matching_bucket": -1, "matching_time": 0.0}
+
+    def _report(pct: float, msg: str) -> None:
+        pct_f = float(pct)
+        msg_s = str(msg)
+        is_matching = msg_s.startswith("Matching ")
+        if is_matching:
+            now = time.time()
+            bucket = int(pct_f)
+            should_print = (
+                bucket > int(last["matching_bucket"])
+                or now - float(last["matching_time"]) >= 10.0
+                or pct_f >= 89.9
+            )
+            if not should_print:
+                return
+            last["matching_bucket"] = bucket
+            last["matching_time"] = now
+        if last["pct"] == pct_f and last["msg"] == msg_s:
+            return
+        last["pct"] = pct_f
+        last["msg"] = msg_s
+        print(f"[{pct_f:6.2f}%] {msg_s}", flush=True)
+
+    return _report
+
+
 if __name__ == "__main__":
     cli_args = build_argparser().parse_args()
-    raise SystemExit(dense_init(cli_args))
+    raise SystemExit(dense_init(cli_args, progress_callback=_cli_progress_callback()))
