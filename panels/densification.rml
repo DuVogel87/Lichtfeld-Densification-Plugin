@@ -119,10 +119,10 @@
       </div>
     </div>
 
-    <!-- Output (collapsible) -->
+    <!-- Other (collapsible) -->
     <div class="section-header" id="hdr-output" data-event-click="toggle_section('output')">
       <span class="section-arrow" id="arrow-output">&#x25B6;</span>
-      <span>Output</span>
+      <span>Other</span>
     </div>
     <div class="section-content collapsed" id="sec-output">
       <div class="setting-row" title="Cap the total number of generated points. Set to 0 for unlimited output.">
@@ -136,28 +136,11 @@
         <input type="range" class="setting-slider" data-value="viz_interval" min="0" max="10" step="1" />
         <span class="slider-value">{{viz_interval}}</span>
       </div>
-    </div>
-
-    <!-- Debug (collapsible) -->
-    <div class="section-header" id="hdr-debug" data-event-click="toggle_section('debug')">
-      <span class="section-arrow" id="arrow-debug">&#x25B6;</span>
-      <span>Debug</span>
-    </div>
-    <div class="section-content collapsed" id="sec-debug">
       <div class="setting-row">
         <label class="setting-label">
-          <input type="checkbox" data-checked="debug_enabled" />
-          <span>Debug Window</span>
+          <input type="checkbox" data-checked="start_training_when_complete" />
+          <span>Start Training When Complete</span>
         </label>
-      </div>
-      <div class="indent" data-if="debug_enabled">
-        <div class="setting-row">
-          <label class="setting-label">
-            <input type="checkbox" data-checked="debug_auto_step" />
-            <span>Auto-step</span>
-          </label>
-        </div>
-        <span class="dense-help text-muted" data-if="!debug_auto_step">Manual stepping: use 'Next pair' in the debug window.</span>
       </div>
     </div>
 

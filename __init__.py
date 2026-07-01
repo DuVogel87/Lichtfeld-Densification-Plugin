@@ -16,17 +16,14 @@ from .panels.densification import (
     DensifyJob,
     DensifyStage,
 )
-from .panels.debug_matches import DebugMatchesPanel
 
-_classes = [DensificationPanel, DebugMatchesPanel]
+_classes = [DensificationPanel]
 
 
 def on_load():
     """Called when plugin loads."""
     for cls in _classes:
         lf.register_class(cls)
-    # Debug panel starts hidden; toggled by the debug checkbox
-    lf.ui.set_panel_enabled(DebugMatchesPanel.id, False)
     lf.log.info("Dense Initialization plugin loaded")
 
 
@@ -46,7 +43,6 @@ __all__ = [
     "dense_init",
     "DensePipelineConfig",
     "DensificationPanel",
-    "DebugMatchesPanel",
     "DensifyResult",
     "DensifyJob",
     "DensifyStage",

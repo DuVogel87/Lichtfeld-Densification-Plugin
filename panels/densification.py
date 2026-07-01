@@ -28,7 +28,6 @@ except ImportError:
 
 from ..core.config import DensePipelineConfig
 from ..core.debug_viz import MatchDebugState
-from .debug_matches import DebugMatchesPanel
 
 
 SCRUB_FIELD_SPECS = {
@@ -372,12 +371,11 @@ class DensificationPanel(lf.ui.Panel):
         self.job = None
         self.last_result = None
         self._pending_import = None
+        self._pending_start_training = False
         self._auto_import = True
+        self._start_training_when_complete = False
 
-        self.debug_state = MatchDebugState()
-        DebugMatchesPanel.set_debug_state(self.debug_state)
-        self._debug_enabled = False
-        self._debug_auto_step = True
+        self.debug_state = None
 
         self.config = DensePipelineConfig(output_path=self._get_temp_output_path())
         self._voxel_size_ui = 0.01  # remembered slider value when filter is toggled
@@ -393,7 +391,7 @@ class DensificationPanel(lf.ui.Panel):
         self._active_run_roi_only_selected: Optional[bool] = None
         self._preview_override_active = False
 
-        self._collapsed = {"cameras", "filtering", "output", "debug"}
+        self._collapsed = {"cameras", "filtering", "output"}
 
         # Track last-known state for dirty detection
         self._last_running = False
@@ -734,6 +732,9 @@ class DensificationPanel(lf.ui.Panel):
         model.bind("viz_interval",
                     lambda: str(self.config.viz_interval),
                     lambda v: self._set_int_config("viz_interval", v, 0, 10))
+        model.bind("start_training_when_complete",
+                    lambda: self._start_training_when_complete,
+                    self._set_start_training_when_complete)
 
         # --- Number-input config values ---
         model.bind("matches_per_ref_str",
@@ -750,14 +751,6 @@ class DensificationPanel(lf.ui.Panel):
         model.bind("voxel_size",
                     lambda: f"{self._voxel_size_ui:.3f}",
                     lambda v: self._set_voxel_size(v))
-
-        # --- Debug controls ---
-        model.bind("debug_enabled",
-                    lambda: self._debug_enabled,
-                    self._set_debug_enabled)
-        model.bind("debug_auto_step",
-                    lambda: self._debug_auto_step,
-                    self._set_debug_auto_step)
 
         # --- Job state (read-only) ---
         model.bind_func("show_idle", lambda: not self._is_running())
@@ -800,9 +793,13 @@ class DensificationPanel(lf.ui.Panel):
         # Handle pending import on main thread
         if self._pending_import:
             path = self._pending_import
+            start_training = self._pending_start_training
             self._pending_import = None
+            self._pending_start_training = False
             lf.log.info(f"Loading dense point cloud: {path}")
-            self._import_ply(path)
+            imported = self._import_ply(path)
+            if imported and start_training:
+                self._start_training_after_import()
 
         dirty = False
 
@@ -872,6 +869,7 @@ class DensificationPanel(lf.ui.Panel):
 
         if self.job and self.job.stage == DensifyStage.CANCELLED and self.last_result is None:
             self.last_result = self.job.result or DensifyResult(success=False, error="Cancelled")
+            self._pending_start_training = False
             if self._preview_override_active:
                 self._restore_base_point_cloud()
             self._active_run_roi_only_selected = None
@@ -922,7 +920,7 @@ class DensificationPanel(lf.ui.Panel):
         return header, arrow, content
 
     def _sync_section_states(self):
-        for name in ("matching", "cameras", "filtering", "output", "debug"):
+        for name in ("matching", "cameras", "filtering", "output"):
             header, arrow, content = self._get_section_elements(name)
             if content:
                 expanded = name not in self._collapsed
@@ -1080,16 +1078,15 @@ class DensificationPanel(lf.ui.Panel):
         setattr(self.config, attr, v)
         self._dirty(attr)
 
-    def _set_debug_enabled(self, value):
-        self._debug_enabled = bool(value)
-        self.debug_state.set_enabled(self._debug_enabled)
-        if not self._debug_enabled:
-            self.debug_state.set_auto_step(True)
-            self.debug_state.release_waiters()
-        # Share state and toggle floating debug panel
-        DebugMatchesPanel.set_debug_state(self.debug_state)
-        lf.ui.set_panel_enabled(DebugMatchesPanel.id, self._debug_enabled)
-        self._dirty("debug_enabled")
+    def _set_start_training_when_complete(self, value):
+        self._start_training_when_complete = bool(value)
+        self._dirty("start_training_when_complete")
+
+    def _start_training_after_import(self):
+        try:
+            lf.start_training()
+        except Exception as exc:
+            lf.log.warn(f"Failed to start training after densification: {exc}")
 
     def _set_distance_filter_enabled(self, value):
         enabled = bool(value)
@@ -1109,13 +1106,6 @@ class DensificationPanel(lf.ui.Panel):
         self._voxel_size_ui = v
         self.config.voxel_size = v
         self._dirty("voxel_size")
-
-    def _set_debug_auto_step(self, value):
-        self._debug_auto_step = bool(value)
-        self.debug_state.set_auto_step(self._debug_auto_step)
-        if self._debug_auto_step:
-            self.debug_state.release_waiters()
-        self._dirty("debug_auto_step")
 
     def _on_num_step(self, handle, event, args):
         if not args or len(args) < 2:
@@ -1180,10 +1170,8 @@ class DensificationPanel(lf.ui.Panel):
             return
 
         self.last_result = None
+        self._pending_start_training = False
 
-        self.debug_state.set_enabled(self._debug_enabled)
-        self.debug_state.set_auto_step(self._debug_auto_step)
-        self.debug_state.release_waiters()
         self._active_run_roi_only_selected = bool(self.config.roi_only_selected)
 
         config = replace(
@@ -1216,19 +1204,23 @@ class DensificationPanel(lf.ui.Panel):
         self.last_result = result
         if self._auto_import and result.output_path:
             self._pending_import = result.output_path
+            self._pending_start_training = bool(self._start_training_when_complete and result.success)
+        else:
+            self._pending_start_training = False
 
     def _on_error(self, error: Exception):
         lf.log.error(f"Densification failed: {error}")
+        self._pending_start_training = False
         if self._preview_override_active:
             self._restore_base_point_cloud()
         self._active_run_roi_only_selected = None
         self.last_result = DensifyResult(success=False, error=str(error))
 
-    def _import_ply(self, ply_path: str):
+    def _import_ply(self, ply_path: str) -> bool:
         """Import the latest dense PLY into the active point cloud."""
         if not ply_path or not os.path.exists(ply_path):
             lf.log.warn(f"PLY file not found: {ply_path}")
-            return
+            return False
 
         try:
             lf.log.debug(f"Loading PLY: {ply_path}")
@@ -1236,19 +1228,19 @@ class DensificationPanel(lf.ui.Panel):
             scene = lf.get_scene()
             if scene is None:
                 lf.log.error("No scene available")
-                return
+                return False
 
             target = self._resolve_target_point_cloud_node(scene)
             if not target:
                 lf.log.error("No point cloud node found to merge into")
-                return
+                return False
 
             dense_points, dense_colors = lf.io.load_point_cloud(ply_path)
 
             point_cloud = target.point_cloud()
             if not point_cloud:
                 lf.log.error(f"Node '{target.name}' has no point cloud data")
-                return
+                return False
 
             run_roi_only_selected = self._run_roi_only_selected()
             if run_roi_only_selected:
@@ -1274,14 +1266,15 @@ class DensificationPanel(lf.ui.Panel):
             self._preview_override_active = True
             if not self._is_running() and not self._pending_import:
                 self._active_run_roi_only_selected = None
+            return True
 
         except Exception as e:
             lf.log.error(f"Failed to import PLY: {e}")
+            return False
         finally:
-            if os.environ.get("LFS_KEEP_TEMP"):
-                return
-            try:
-                if os.path.exists(ply_path):
-                    os.remove(ply_path)
-            except Exception:
-                lf.log.warn(f"Failed to delete temp file: {ply_path}")
+            if not os.environ.get("LFS_KEEP_TEMP"):
+                try:
+                    if os.path.exists(ply_path):
+                        os.remove(ply_path)
+                except Exception:
+                    lf.log.warn(f"Failed to delete temp file: {ply_path}")
