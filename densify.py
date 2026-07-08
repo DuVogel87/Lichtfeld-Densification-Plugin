@@ -7,7 +7,7 @@ import argparse
 import os
 import sys
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import lichtfeld as lf
 import numpy as np
@@ -23,7 +23,7 @@ from .core.geometry import K_from_camera, P_from_KRt, cam_center_world, pose_wor
 from .core.image_utils import find_image, image_dir, to_uint8_rgb
 from .core.pipeline import PipelineCancelled, run_dense_pipeline
 from .core.selection import nearest_neighbors, select_cameras_by_visibility, select_cameras_kcenters
-from .core.writers import write_ply, write_points3D_bin
+from .core.writers import write_ply, write_points3D_bin, write_sparse_model_bin
 
 
 def _voxel_downsample(
@@ -48,6 +48,33 @@ def _voxel_downsample(
     out_xyz = np.asarray(down.points, dtype=np.float32)
     out_rgb = np.asarray(down.colors, dtype=np.float32)  # [0, 1]
     return out_xyz, out_rgb
+
+
+def _voxel_select_track_preserving(
+    xyz: np.ndarray,
+    rgb: np.ndarray,
+    err: np.ndarray,
+    tracks: Sequence[Sequence[Tuple[int, float, float]]],
+    voxel_size: float,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, List[List[Tuple[int, float, float]]]]:
+    if voxel_size <= 0.0 or xyz.shape[0] == 0:
+        return xyz, rgb, err, [list(t) for t in tracks]
+
+    voxels = np.floor(xyz / float(voxel_size)).astype(np.int64)
+    chosen: Dict[Tuple[int, int, int], int] = {}
+    for idx, voxel in enumerate(voxels):
+        key = (int(voxel[0]), int(voxel[1]), int(voxel[2]))
+        prev = chosen.get(key)
+        if prev is None:
+            chosen[key] = idx
+            continue
+        track_len = len(tracks[idx])
+        prev_track_len = len(tracks[prev])
+        if track_len > prev_track_len or (track_len == prev_track_len and float(err[idx]) < float(err[prev])):
+            chosen[key] = idx
+
+    sel = np.asarray(sorted(chosen.values()), dtype=np.int64)
+    return xyz[sel], rgb[sel], err[sel], [list(tracks[i]) for i in sel]
 
 
 
@@ -111,13 +138,63 @@ def _apply_point_cap(
     xyz: np.ndarray,
     rgb: np.ndarray,
     err: np.ndarray,
+    tracks: Optional[Sequence[Sequence[Tuple[int, float, float]]]],
     max_points: int,
     seed: int,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Optional[List[List[Tuple[int, float, float]]]]]:
     if max_points > 0 and xyz.shape[0] > max_points:
         sel = np.random.default_rng(seed).choice(xyz.shape[0], size=max_points, replace=False)
-        return xyz[sel], rgb[sel], err[sel]
-    return xyz, rgb, err
+        capped_tracks = None if tracks is None else [list(tracks[i]) for i in sel]
+        return xyz[sel], rgb[sel], err[sel], capped_tracks
+    return xyz, rgb, err, None if tracks is None else [list(t) for t in tracks]
+
+
+def _apply_track_filter(
+    xyz: np.ndarray,
+    rgb: np.ndarray,
+    err: np.ndarray,
+    tracks: Sequence[Sequence[Tuple[int, float, float]]],
+    min_track_length: int,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, List[List[Tuple[int, float, float]]]]:
+    min_track = max(0, int(min_track_length))
+    if min_track <= 0:
+        return xyz, rgb, err, [list(t) for t in tracks]
+    keep = np.asarray([len(track) >= min_track for track in tracks], dtype=bool)
+    return xyz[keep], rgb[keep], err[keep], [list(track) for track, ok in zip(tracks, keep) if ok]
+
+
+def _log_track_filter_stats(
+    label: str,
+    tracks_before: Sequence[Sequence[Tuple[int, float, float]]],
+    tracks_after: Sequence[Sequence[Tuple[int, float, float]]],
+    min_track_length: int,
+) -> None:
+    before = len(tracks_before)
+    after = len(tracks_after)
+    kept_pct = 100.0 if before == 0 else (float(after) / float(before)) * 100.0
+    before_lengths = np.asarray([len(track) for track in tracks_before], dtype=np.int32)
+    after_lengths = np.asarray([len(track) for track in tracks_after], dtype=np.int32)
+
+    def fmt(lengths: np.ndarray) -> str:
+        if lengths.size == 0:
+            return "empty"
+        return (
+            f"min={int(lengths.min())}, "
+            f"mean={float(lengths.mean()):.2f}, "
+            f"max={int(lengths.max())}"
+        )
+
+    if int(min_track_length) > 0:
+        lf.log.info(
+            f"{label}: min_track_length={int(min_track_length)} kept "
+            f"{after:,}/{before:,} points ({kept_pct:.1f}%). "
+            f"Before [{fmt(before_lengths)}], after [{fmt(after_lengths)}]"
+        )
+    else:
+        lf.log.info(
+            f"{label}: track filtering disabled (min_track_length=0). "
+            f"{before:,} points, track lengths [{fmt(before_lengths)}]"
+        )
 
 
 def _effective_neighbor_count(requested: int, camera_count: int) -> int:
@@ -175,6 +252,7 @@ def dense_init(
         sampson_thresh=args.sampson_thresh,
         min_parallax_deg=args.min_parallax_deg,
         max_points=args.max_points,
+        min_track_length=args.min_track_length,
         no_filter=args.no_filter,
         seed=args.seed,
         viz_interval=0,
@@ -202,7 +280,22 @@ def dense_init(
             progress_callback(0.0, "Cancelled")
         return 2
 
-    xyz, rgb, err = _apply_point_cap(result.xyz, result.rgb, result.err, args.max_points, args.seed)
+    tracks = getattr(result, "tracks", None)
+    if tracks is not None:
+        tracks_before = [list(track) for track in tracks]
+        xyz, rgb, err, tracks = _apply_track_filter(
+            result.xyz,
+            result.rgb,
+            result.err,
+            tracks,
+            args.min_track_length,
+        )
+        _log_track_filter_stats("COLMAP track filter", tracks_before, tracks, args.min_track_length)
+    else:
+        xyz, rgb, err = result.xyz, result.rgb, result.err
+    if xyz.shape[0] == 0:
+        raise RuntimeError("No points remain after track-length filtering.")
+    xyz, rgb, err, tracks = _apply_point_cap(xyz, rgb, err, tracks, args.max_points, args.seed)
     if progress_callback:
         progress_callback(95.0, "Writing output...")
     _write_output(config.output_path, xyz, rgb, err)
@@ -297,19 +390,31 @@ def dense_init_from_lfs(
     if _cancel_requested(cancel_requested):
         return 2, "Cancelled"
 
-    xyz, rgb, err = _apply_point_cap(result.xyz, result.rgb, result.err, config.max_points, config.seed)
+    tracks_before = [list(track) for track in result.tracks]
+    xyz, rgb, err, tracks = _apply_track_filter(
+        result.xyz,
+        result.rgb,
+        result.err,
+        result.tracks,
+        config.min_track_length,
+    )
+    _log_track_filter_stats("COLMAP track filter", tracks_before, tracks, config.min_track_length)
+    if xyz.shape[0] == 0:
+        return 1, "No points remain after track-length filtering."
+
+    xyz, rgb, err, tracks = _apply_point_cap(xyz, rgb, err, tracks, config.max_points, config.seed)
 
     # Voxel-based distance filtering for uniform point distribution
     if config.voxel_size > 0.0:
         if progress_callback:
             progress_callback(93.0, "Applying distance filter...")
-        xyz, rgb = _voxel_downsample(xyz, rgb, config.voxel_size)
+        xyz, rgb, err, tracks = _voxel_select_track_preserving(xyz, rgb, err, tracks, config.voxel_size)
         lf.log.info(f"Distance filter ({config.voxel_size:.4f}): {xyz.shape[0]:,} points remaining")
 
     if progress_callback:
-        progress_callback(95.0, "Writing output PLY...")
-    write_ply(config.output_path, xyz, to_uint8_rgb(rgb))
-    lf.log.info(f"Dense point cloud saved to {config.output_path} ({xyz.shape[0]:,} points)")
+        progress_callback(95.0, "Writing COLMAP sparse output...")
+    write_sparse_model_bin(config.output_path, records, xyz, to_uint8_rgb(rgb), err, tracks)
+    lf.log.info(f"Dense sparse model saved to {config.output_path} ({xyz.shape[0]:,} points)")
     if progress_callback:
         progress_callback(100.0, f"Done! {xyz.shape[0]:,} points")
     return 0, config.output_path
@@ -398,6 +503,12 @@ def build_argparser():
         type=int,
         default=0,
         help="Optional cap on total points (0 = unlimited)",
+    )
+    ap.add_argument(
+        "--min_track_length",
+        type=int,
+        default=0,
+        help="Minimum generated track length to keep (0 = disabled)",
     )
     ap.add_argument(
         "--prefetch_packages",

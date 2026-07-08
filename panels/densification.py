@@ -8,6 +8,7 @@ simply load your scene, adjust parameters if desired, and click Start.
 """
 
 import os
+import shutil
 import threading
 import time
 import uuid
@@ -28,6 +29,39 @@ except ImportError:
 
 from ..core.config import DensePipelineConfig
 from ..core.debug_viz import MatchDebugState
+from ..core.writers import read_points3D_bin_point_cloud
+
+
+def _format_track_lengths(track_lengths: np.ndarray) -> str:
+    if track_lengths.size == 0:
+        return "empty"
+    return (
+        f"min={int(track_lengths.min())}, "
+        f"mean={float(track_lengths.mean()):.2f}, "
+        f"max={int(track_lengths.max())}"
+    )
+
+
+def _log_sparse_import_track_stats(
+    total_track_lengths: np.ndarray,
+    kept_track_lengths: np.ndarray,
+    min_track_length: int,
+) -> None:
+    before = int(total_track_lengths.size)
+    after = int(kept_track_lengths.size)
+    kept_pct = 100.0 if before == 0 else (float(after) / float(before)) * 100.0
+    if int(min_track_length) > 0:
+        lf.log.info(
+            f"COLMAP sparse import validation: min_track_length={int(min_track_length)} loaded "
+            f"{after:,}/{before:,} points ({kept_pct:.1f}%). "
+            f"Track lengths in written sparse model [{_format_track_lengths(kept_track_lengths)}]"
+        )
+    else:
+        lf.log.info(
+            "COLMAP sparse import validation: track filtering disabled "
+            f"(min_track_length=0). {before:,} points, "
+            f"track lengths [{_format_track_lengths(total_track_lengths)}]"
+        )
 
 
 SCRUB_FIELD_SPECS = {
@@ -81,6 +115,13 @@ SCRUB_FIELD_SPECS = {
         data_type=float,
     ),
     "viz_interval": ScrubFieldSpec(
+        min_value=0.0,
+        max_value=10.0,
+        step=1.0,
+        fmt="%d",
+        data_type=int,
+    ),
+    "min_track_length": ScrubFieldSpec(
         min_value=0.0,
         max_value=10.0,
         step=1.0,
@@ -295,17 +336,15 @@ class DensifyJob:
             elapsed = time.time() - t0
             output_path = result_info  # On success, this is the output path
 
-            # Count points from the output file (read PLY header)
+            # Count points from the output sparse model.
             num_points = 0
-            if output_path and os.path.exists(output_path):
-                with open(output_path, "rb") as f:
-                    for line in f:
-                        line = line.decode("ascii", errors="ignore").strip()
-                        if line.startswith("element vertex"):
-                            num_points = int(line.split()[-1])
-                            break
-                        if line == "end_header":
-                            break
+            points3d_path = os.path.join(output_path, "points3D.bin") if output_path else ""
+            if points3d_path and os.path.exists(points3d_path):
+                points, _colors, _tracks = read_points3D_bin_point_cloud(
+                    points3d_path,
+                    min_track_length=self.config.min_track_length,
+                )
+                num_points = int(points.shape[0])
 
             result = DensifyResult(
                 success=True,
@@ -415,7 +454,7 @@ class DensificationPanel(lf.ui.Panel):
 
     @staticmethod
     def _get_temp_output_path() -> str:
-        return os.path.join(DensificationPanel._get_cache_dir(), f"dense_{uuid.uuid4().hex}.ply")
+        return os.path.join(DensificationPanel._get_cache_dir(), f"dense_{uuid.uuid4().hex}", "sparse", "0")
 
     @staticmethod
     def _cleanup_cache(max_age_seconds: float = 3600.0):
@@ -427,6 +466,8 @@ class DensificationPanel(lf.ui.Panel):
             try:
                 if os.path.isfile(path) and now - os.path.getmtime(path) > max_age_seconds:
                     os.remove(path)
+                elif os.path.isdir(path) and now - os.path.getmtime(path) > max_age_seconds:
+                    shutil.rmtree(path, ignore_errors=True)
             except Exception:
                 pass
 
@@ -500,6 +541,9 @@ class DensificationPanel(lf.ui.Panel):
 
     def _nns_per_ref_max(self) -> int:
         return max(1, min(10, self._get_effective_camera_count() - 1))
+
+    def _min_track_length_max(self) -> int:
+        return max(0, min(self._get_effective_camera_count(), int(self.config.nns_per_ref) + 1))
 
     def _camera_scope_text(self) -> str:
         total = self._get_camera_count()
@@ -729,6 +773,9 @@ class DensificationPanel(lf.ui.Panel):
         model.bind("min_parallax_deg",
                     lambda: f"{self.config.min_parallax_deg:.1f}",
                     lambda v: self._set_float_config("min_parallax_deg", v, 0.0, 5.0))
+        model.bind("min_track_length",
+                    lambda: str(self.config.min_track_length),
+                    lambda v: self._set_int_config("min_track_length", v, 0, self._min_track_length_max()))
         model.bind("viz_interval",
                     lambda: str(self.config.viz_interval),
                     lambda v: self._set_int_config("viz_interval", v, 0, 10))
@@ -797,7 +844,7 @@ class DensificationPanel(lf.ui.Panel):
             self._pending_import = None
             self._pending_start_training = False
             lf.log.info(f"Loading dense point cloud: {path}")
-            imported = self._import_ply(path)
+            imported = self._import_output(path)
             if imported and start_training:
                 self._start_training_after_import()
 
@@ -901,6 +948,7 @@ class DensificationPanel(lf.ui.Panel):
                 "has_masks",
                 "use_masks",
                 "nns_per_ref",
+                "min_track_length",
             )
 
     def on_unmount(self, doc):
@@ -965,6 +1013,8 @@ class DensificationPanel(lf.ui.Panel):
             return float(self.config.sampson_thresh)
         if prop == "min_parallax_deg":
             return float(self.config.min_parallax_deg)
+        if prop == "min_track_length":
+            return float(self.config.min_track_length)
         if prop == "voxel_size":
             return float(self._voxel_size_ui)
         if prop == "viz_interval":
@@ -990,6 +1040,9 @@ class DensificationPanel(lf.ui.Panel):
         if prop == "min_parallax_deg":
             self._set_float_config("min_parallax_deg", value, 0.0, 5.0)
             return
+        if prop == "min_track_length":
+            self._set_int_config("min_track_length", value, 0, self._min_track_length_max())
+            return
         if prop == "voxel_size":
             self._set_voxel_size(value)
             return
@@ -1003,10 +1056,17 @@ class DensificationPanel(lf.ui.Panel):
             "nns_per_ref",
             max_value=float(self._nns_per_ref_max()),
         )
+        if self._update_scrub_spec("min_track_length", max_value=float(self._min_track_length_max())):
+            changed = True
         max_nns = self._nns_per_ref_max()
         if self.config.nns_per_ref > max_nns:
             self.config.nns_per_ref = max_nns
             self._dirty("nns_per_ref")
+            changed = True
+        max_track = self._min_track_length_max()
+        if self.config.min_track_length > max_track:
+            self.config.min_track_length = max_track
+            self._dirty("min_track_length")
             changed = True
         return changed
 
@@ -1056,7 +1116,16 @@ class DensificationPanel(lf.ui.Panel):
         max_nns = self._nns_per_ref_max()
         if self.config.nns_per_ref > max_nns:
             self.config.nns_per_ref = max_nns
-        self._dirty("roi_only_selected", "camera_scope_text", "show_roi_selection_warning", "nns_per_ref")
+        max_track = self._min_track_length_max()
+        if self.config.min_track_length > max_track:
+            self.config.min_track_length = max_track
+        self._dirty(
+            "roi_only_selected",
+            "camera_scope_text",
+            "show_roi_selection_warning",
+            "nns_per_ref",
+            "min_track_length",
+        )
 
     def _set_float_config(self, attr, value, vmin, vmax):
         try:
@@ -1192,6 +1261,11 @@ class DensificationPanel(lf.ui.Panel):
     def _on_sequential_viz(self, ply_path: str):
         self._pending_import = ply_path
 
+    def _import_output(self, path: str) -> bool:
+        if os.path.isdir(path):
+            return self._import_sparse_model(path)
+        return self._import_ply(path)
+
     def _on_complete(self, result: DensifyResult):
         base_count = self._row_count(self._base_point_cloud_points)
         run_roi_only_selected = self._run_roi_only_selected()
@@ -1278,3 +1352,86 @@ class DensificationPanel(lf.ui.Panel):
                         os.remove(ply_path)
                 except Exception:
                     lf.log.warn(f"Failed to delete temp file: {ply_path}")
+
+    def _import_sparse_model(self, sparse_dir: str) -> bool:
+        """Import final dense COLMAP sparse output into the active point cloud."""
+        points3d_path = os.path.join(sparse_dir, "points3D.bin")
+        if not os.path.exists(points3d_path):
+            lf.log.warn(f"COLMAP points3D.bin not found: {points3d_path}")
+            return False
+
+        try:
+            lf.log.debug(f"Loading dense sparse model: {sparse_dir}")
+
+            scene = lf.get_scene()
+            if scene is None:
+                lf.log.error("No scene available")
+                return False
+
+            target = self._resolve_target_point_cloud_node(scene)
+            if not target:
+                lf.log.error("No point cloud node found to merge into")
+                return False
+
+            _all_points, _all_colors, all_track_lengths = read_points3D_bin_point_cloud(
+                points3d_path,
+                min_track_length=0,
+            )
+            dense_points, dense_colors, track_lengths = read_points3D_bin_point_cloud(
+                points3d_path,
+                min_track_length=self.config.min_track_length,
+            )
+            _log_sparse_import_track_stats(
+                all_track_lengths,
+                track_lengths,
+                self.config.min_track_length,
+            )
+            if dense_points.shape[0] == 0:
+                lf.log.warn("No dense sparse points remain after track filtering")
+                return False
+
+            point_cloud = target.point_cloud()
+            if not point_cloud:
+                lf.log.error(f"Node '{target.name}' has no point cloud data")
+                return False
+
+            run_roi_only_selected = self._run_roi_only_selected()
+            if run_roi_only_selected:
+                merged_points_np, merged_colors_np = self._build_roi_merge_arrays(
+                    dense_points,
+                    dense_colors,
+                )
+                self._set_point_cloud_data(point_cloud, merged_points_np, merged_colors_np)
+                out_points = merged_points_np
+                lf.log.debug(
+                    f"Merged ROI dense sparse model into '{target.name}' "
+                    f"({self._row_count(out_points):,} total points)"
+                )
+            else:
+                self._set_point_cloud_data(point_cloud, dense_points, dense_colors)
+                out_points = dense_points
+                lf.log.debug(
+                    f"Overwrote '{target.name}' with dense sparse model "
+                    f"({self._row_count(out_points):,} points, "
+                    f"min track={int(track_lengths.min()) if track_lengths.size else 0})"
+                )
+
+            scene.notify_changed()
+            self._preview_override_active = True
+            if not self._is_running() and not self._pending_import:
+                self._active_run_roi_only_selected = None
+            return True
+
+        except Exception as e:
+            lf.log.error(f"Failed to import sparse model: {e}")
+            return False
+        finally:
+            if not os.environ.get("LFS_KEEP_TEMP"):
+                try:
+                    cleanup_root = sparse_dir
+                    parent = os.path.dirname(sparse_dir)
+                    if os.path.basename(sparse_dir) == "0" and os.path.basename(parent) == "sparse":
+                        cleanup_root = os.path.dirname(parent)
+                    shutil.rmtree(cleanup_root, ignore_errors=True)
+                except Exception:
+                    lf.log.warn(f"Failed to delete temp sparse model: {sparse_dir}")

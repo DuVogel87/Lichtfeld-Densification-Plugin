@@ -104,6 +104,11 @@
         <input type="range" class="setting-slider" data-value="min_parallax_deg" min="0.0" max="5.0" step="0.1" />
         <span class="slider-value">{{min_parallax_deg | format_float(1)}}</span>
       </div>
+      <div class="setting-row" title="Keep dense points observed in at least this many images. 0 disables track filtering.">
+        <span class="prop-label">Minimum Track Length</span>
+        <input type="range" class="setting-slider" data-value="min_track_length" min="0" max="11" step="1" />
+        <span class="slider-value">{{min_track_length}}</span>
+      </div>
       <div class="setting-row">
         <label class="setting-label">
           <input type="checkbox" data-checked="distance_filter_enabled" />

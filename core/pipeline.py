@@ -39,6 +39,7 @@ class PipelineResult:
     xyz: np.ndarray
     rgb: np.ndarray
     err: np.ndarray
+    tracks: List[List[Tuple[int, float, float]]]
     elapsed_seconds: float
     pairs_processed: int
 
@@ -110,6 +111,7 @@ class _TriangulatedReference:
     xyz: np.ndarray
     rgb: np.ndarray
     err: np.ndarray
+    tracks: List[List[Tuple[int, float, float]]]
     debug_matches_by_nbr: Dict[int, np.ndarray]
     debug_cert_by_nbr: Dict[int, np.ndarray]
 
@@ -119,6 +121,7 @@ class _PipelineAccumulator:
     xyz_parts: List[np.ndarray] = field(default_factory=list)
     rgb_parts: List[np.ndarray] = field(default_factory=list)
     err_parts: List[np.ndarray] = field(default_factory=list)
+    track_parts: List[List[List[Tuple[int, float, float]]]] = field(default_factory=list)
     pairs_processed: int = 0
     pair_counter: int = 0
 
@@ -126,6 +129,7 @@ class _PipelineAccumulator:
         self.xyz_parts.append(tri_ref.xyz)
         self.rgb_parts.append(tri_ref.rgb)
         self.err_parts.append(tri_ref.err)
+        self.track_parts.append(tri_ref.tracks)
         self.pairs_processed += 1
 
 
@@ -651,6 +655,8 @@ def _triangulate_ref(
         return None
 
     nn_idx_flat = best_k.reshape(-1).numpy()[sel_idx]
+    selected_warps = warp_stack.reshape(len(nn_ids), -1, 4)[:, sel_idx, :].numpy()
+    selected_certs = cert_stack.reshape(len(nn_ids), -1)[:, sel_idx].numpy()
     sel = agg[sel_idx]
     xA = (sel[:, 0] + 1.0) * 0.5 * (w_match - 1)
     yA = (sel[:, 1] + 1.0) * 0.5 * (h_match - 1)
@@ -682,28 +688,27 @@ def _triangulate_ref(
     syA = hA_cam / float(h_match)
     uvA_full = np.stack([xA * sxA, yA * syA], axis=1)
 
-    groups: Dict[int, List[int]] = {}
-    for i, kidx in enumerate(nn_idx_flat):
-        nbr_id = nn_ids[int(kidx)]
-        groups.setdefault(nbr_id, []).append(i)
-
-    job_xyz, job_rgb, job_err = [], [], []
-    debug_matches_by_nbr: Dict[int, np.ndarray] = {}
-    debug_cert_by_nbr: Dict[int, np.ndarray] = {}
+    candidates_by_sample: List[List[Tuple[np.ndarray, float, int, float, float, float, float, float, float, float]]] = [
+        [] for _ in range(sel_idx.shape[0])
+    ]
+    debug_matches_tmp: Dict[int, List[List[float]]] = {}
+    debug_cert_tmp: Dict[int, List[float]] = {}
     cert_denom = float(matcher_sample_cap) if float(matcher_sample_cap) > 1e-6 else 1.0
 
-    for nbr_id, idxs in groups.items():
-        idxs = np.asarray(idxs, dtype=np.int64)
+    for kidx, nbr_id in enumerate(nn_ids):
+        idxs = np.arange(sel_idx.shape[0], dtype=np.int64)
         wB_cam, hB_cam = size_by[nbr_id]
         sxB = wB_cam / float(w_match)
         syB = hB_cam / float(h_match)
 
-        xB = (xB_norm[idxs] + 1.0) * 0.5 * (w_match - 1)
-        yB = (yB_norm[idxs] + 1.0) * 0.5 * (h_match - 1)
+        xB_norm_k = selected_warps[kidx, :, 2]
+        yB_norm_k = selected_warps[kidx, :, 3]
+        xB = (xB_norm_k + 1.0) * 0.5 * (w_match - 1)
+        yB = (yB_norm_k + 1.0) * 0.5 * (h_match - 1)
         uvB = np.stack([xB * sxB, yB * syB], axis=1)
-        xA_pair = xA[idxs]
-        yA_pair = yA[idxs]
-        cert_pair = cert_sel[idxs]
+        xA_pair = xA
+        yA_pair = yA
+        cert_pair = selected_certs[kidx]
 
         if (not config.no_filter) and config.sampson_thresh > 0:
             F = fundamental_from_world2cam(
@@ -750,31 +755,127 @@ def _triangulate_ref(
             if not np.any(keep):
                 continue
 
+        kept_idxs = idxs[keep]
         Xw = Xi[keep][:, :3].astype(np.float32)
-        col = rgb_ref[idxs][keep].astype(np.float32)
         e = err[keep].astype(np.float32)
+        uvB_keep = uvB[keep]
+        xA_keep = np.clip(xA_pair[keep], 0.0, float(w_match - 1))
+        yA_keep = np.clip(yA_pair[keep], 0.0, float(h_match - 1))
+        xB_keep = np.clip(xB[keep], 0.0, float(w_match - 1))
+        yB_keep = np.clip(yB[keep], 0.0, float(h_match - 1))
+        cert_keep = np.clip(cert_pair[keep] / cert_denom, 0.0, 1.0).astype(np.float32, copy=False)
 
-        job_xyz.append(Xw)
-        job_rgb.append(col)
-        job_err.append(e)
+        for local_idx, point, point_err, xa_m, ya_m, xb_m, yb_m, uvb, cert_norm in zip(
+            kept_idxs,
+            Xw,
+            e,
+            xA_keep,
+            yA_keep,
+            xB_keep,
+            yB_keep,
+            uvB_keep,
+            cert_keep,
+        ):
+            candidates_by_sample[int(local_idx)].append(
+                (
+                    point,
+                    float(point_err),
+                    int(nbr_id),
+                    float(uvb[0]),
+                    float(uvb[1]),
+                    float(xa_m),
+                    float(ya_m),
+                    float(xb_m),
+                    float(yb_m),
+                    float(cert_norm),
+                )
+            )
 
+    out_xyz: List[np.ndarray] = []
+    out_rgb: List[np.ndarray] = []
+    out_err: List[float] = []
+    out_tracks: List[List[Tuple[int, float, float]]] = []
+
+    for sample_idx, candidates in enumerate(candidates_by_sample):
+        if not candidates:
+            continue
+
+        points_np = np.stack([c[0] for c in candidates], axis=0).astype(np.float32, copy=False)
+        errs_np = np.asarray([c[1] for c in candidates], dtype=np.float32)
+        weights = 1.0 / np.maximum(errs_np, 1.0e-4)
+        Xw = (points_np * weights[:, None]).sum(axis=0) / max(float(weights.sum()), 1.0e-8)
+        Xh = np.concatenate([Xw.astype(np.float32), np.ones((1,), dtype=np.float32)])
+
+        ref_obs = uvA_full[sample_idx]
+        ref_err = reprojection_errors(P_by[ref_id], Xh[None, :], ref_obs[None, :])[0]
+        if not config.no_filter and (not np.isfinite(ref_err) or ref_err > float(config.reproj_thresh)):
+            continue
+
+        track: List[Tuple[int, float, float]] = [
+            (int(ref_id), float(ref_obs[0]), float(ref_obs[1]))
+        ]
+        support_errs = [float(ref_err)] if np.isfinite(ref_err) else []
+        used_images = {int(ref_id)}
+        debug_for_point: List[Tuple[int, List[float], float]] = []
+
+        for candidate in candidates:
+            (
+                _point,
+                pair_err,
+                nbr_id,
+                uvb_x,
+                uvb_y,
+                xa_match,
+                ya_match,
+                xb_match,
+                yb_match,
+                cert_norm,
+            ) = candidate
+            if nbr_id in used_images:
+                continue
+            nbr_err = reprojection_errors(
+                P_by[nbr_id],
+                Xh[None, :],
+                np.asarray([[uvb_x, uvb_y]], dtype=np.float32),
+            )[0]
+            if not config.no_filter and (not np.isfinite(nbr_err) or nbr_err > float(config.reproj_thresh)):
+                continue
+            used_images.add(nbr_id)
+            track.append((int(nbr_id), float(uvb_x), float(uvb_y)))
+            if np.isfinite(nbr_err):
+                support_errs.append(float(max(nbr_err, pair_err)))
+            debug_for_point.append(
+                (
+                    int(nbr_id),
+                    [float(xa_match), float(ya_match), float(xb_match), float(yb_match)],
+                    float(cert_norm),
+                )
+            )
+
+        out_xyz.append(Xw.astype(np.float32, copy=False))
+        out_rgb.append(rgb_ref[sample_idx].astype(np.float32, copy=False))
+        out_err.append(float(max(support_errs) if support_errs else np.nan_to_num(errs_np).max()))
+        out_tracks.append(track)
         if collect_debug_matches:
-            xA_keep = np.clip(xA_pair[keep], 0.0, float(w_match - 1))
-            yA_keep = np.clip(yA_pair[keep], 0.0, float(h_match - 1))
-            xB_keep = np.clip(xB[keep], 0.0, float(w_match - 1))
-            yB_keep = np.clip(yB[keep], 0.0, float(h_match - 1))
-            matches_keep = np.stack([xA_keep, yA_keep, xB_keep, yB_keep], axis=1).astype(np.float32, copy=False)
-            cert_keep = np.clip(cert_pair[keep] / cert_denom, 0.0, 1.0).astype(np.float32, copy=False)
-            debug_matches_by_nbr[nbr_id] = matches_keep
-            debug_cert_by_nbr[nbr_id] = cert_keep
+            for nbr_id, match, cert_norm in debug_for_point:
+                debug_matches_tmp.setdefault(nbr_id, []).append(match)
+                debug_cert_tmp.setdefault(nbr_id, []).append(cert_norm)
 
-    if not job_xyz:
+    if not out_xyz:
         return None
 
+    debug_matches_by_nbr: Dict[int, np.ndarray] = {}
+    debug_cert_by_nbr: Dict[int, np.ndarray] = {}
+    if collect_debug_matches:
+        for nbr_id, matches in debug_matches_tmp.items():
+            debug_matches_by_nbr[nbr_id] = np.asarray(matches, dtype=np.float32).reshape((-1, 4))
+            debug_cert_by_nbr[nbr_id] = np.asarray(debug_cert_tmp.get(nbr_id, ()), dtype=np.float32)
+
     return _TriangulatedReference(
-        xyz=np.concatenate(job_xyz, axis=0),
-        rgb=np.concatenate(job_rgb, axis=0),
-        err=np.concatenate(job_err, axis=0),
+        xyz=np.stack(out_xyz, axis=0).astype(np.float32, copy=False),
+        rgb=np.stack(out_rgb, axis=0).astype(np.float32, copy=False),
+        err=np.asarray(out_err, dtype=np.float32),
+        tracks=out_tracks,
         debug_matches_by_nbr=debug_matches_by_nbr,
         debug_cert_by_nbr=debug_cert_by_nbr,
     )
@@ -917,12 +1018,14 @@ def run_dense_pipeline(
     xyz = np.concatenate(points.xyz_parts, axis=0)
     rgb = np.concatenate(points.rgb_parts, axis=0)
     err = np.concatenate(points.err_parts, axis=0)
+    tracks = [track for track_part in points.track_parts for track in track_part]
     elapsed = time.time() - t0
 
     return PipelineResult(
         xyz=xyz,
         rgb=rgb,
         err=err,
+        tracks=tracks,
         elapsed_seconds=elapsed,
         pairs_processed=points.pairs_processed,
     )
