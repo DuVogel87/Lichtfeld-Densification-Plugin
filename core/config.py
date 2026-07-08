@@ -17,7 +17,7 @@ class DensePipelineConfig:
     sampson_thresh: float = 5.0
     min_parallax_deg: float = 0.5
     max_points: int = 0
-    min_track_length: int = 0
+    min_track_length: int = 1
     no_filter: bool = False
     use_masks: bool = True
     voxel_size: float = 0.0
