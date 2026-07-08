@@ -507,7 +507,7 @@ def build_argparser():
     ap.add_argument(
         "--min_track_length",
         type=int,
-        default=0,
+        default=1,
         help="Minimum generated track length to keep (0 = disabled)",
     )
     ap.add_argument(
