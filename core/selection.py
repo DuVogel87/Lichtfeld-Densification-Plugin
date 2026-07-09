@@ -1,10 +1,12 @@
 """Camera selection utilities."""
 from __future__ import annotations
 
-from typing import Dict, List
+from typing import TYPE_CHECKING, Dict, List
 
 import numpy as np
-import pycolmap
+
+if TYPE_CHECKING:
+    import pycolmap
 
 
 def select_cameras_by_visibility(rec: pycolmap.Reconstruction, k: int) -> List[int]:

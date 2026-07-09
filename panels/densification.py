@@ -9,6 +9,7 @@ simply load your scene, adjust parameters if desired, and click Start.
 
 import os
 import shutil
+import sys
 import threading
 import time
 import uuid
@@ -20,7 +21,6 @@ from typing import Callable, Optional, List, ClassVar
 
 import lichtfeld as lf
 import numpy as np
-import torch
 
 try:
     from lfs_plugins import ScrubFieldController, ScrubFieldSpec
@@ -666,6 +666,22 @@ class DensificationPanel(lf.ui.Panel):
             return False
 
     @staticmethod
+    def _is_torch_tensor(value) -> bool:
+        torch_mod = sys.modules.get("torch")
+        if torch_mod is not None:
+            try:
+                return bool(torch_mod.is_tensor(value))
+            except Exception:
+                pass
+        value_type = type(value)
+        module = getattr(value_type, "__module__", "")
+        return (
+            (module == "torch" or module.startswith("torch."))
+            and hasattr(value, "detach")
+            and hasattr(value, "cpu")
+        )
+
+    @staticmethod
     def _to_lf_tensor(value, *, copy: bool = True):
         if DensificationPanel._is_lf_tensor(value):
             return value.clone() if copy and hasattr(value, "clone") else value
@@ -675,7 +691,7 @@ class DensificationPanel(lf.ui.Panel):
     def _to_numpy_array(value):
         if DensificationPanel._is_lf_tensor(value):
             return np.asarray(value.numpy(copy=True))
-        if torch.is_tensor(value):
+        if DensificationPanel._is_torch_tensor(value):
             return value.detach().cpu().numpy()
         if hasattr(value, "numpy") and callable(value.numpy):
             return np.asarray(value.numpy(copy=True))
