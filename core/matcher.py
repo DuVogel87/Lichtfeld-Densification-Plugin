@@ -18,8 +18,6 @@ if str(_ROMA_SRC) not in sys.path:
     sys.path.insert(0, str(_ROMA_SRC))
 
 
-from romav2 import RoMaV2
-
 _ROMA_WEIGHTS_FILE = "romav2.pt"
 
 
@@ -75,6 +73,8 @@ class RomaMatcher:
     """Wrapper around RoMaV2 for dense matching."""
 
     def __init__(self, device: str = "cuda", mode: str = "outdoor", setting: str = "fast"):
+        from romav2 import RoMaV2
+
         del mode  # Legacy arg kept for API compatibility.
         self.device = torch.device(device)
         torch.set_float32_matmul_precision("highest")

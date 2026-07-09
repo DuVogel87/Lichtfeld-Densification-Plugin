@@ -1,10 +1,12 @@
 """Geometry helpers for densification pipeline."""
 from __future__ import annotations
 
-from typing import Tuple
+from typing import TYPE_CHECKING, Tuple
 
 import numpy as np
-import pycolmap
+
+if TYPE_CHECKING:
+    import pycolmap
 
 
 def K_from_camera(cam: pycolmap.Camera) -> np.ndarray:

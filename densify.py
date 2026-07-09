@@ -7,11 +7,10 @@ import argparse
 import os
 import sys
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Sequence, Tuple
 
 import lichtfeld as lf
 import numpy as np
-import pycolmap
 
 _THIS_DIR = Path(__file__).resolve().parent
 if str(_THIS_DIR) not in sys.path:
@@ -21,9 +20,11 @@ from .core.camera_models import CameraRecord
 from .core.config import DensePipelineConfig
 from .core.geometry import K_from_camera, P_from_KRt, cam_center_world, pose_world2cam
 from .core.image_utils import find_image, image_dir, to_uint8_rgb
-from .core.pipeline import PipelineCancelled, run_dense_pipeline
 from .core.selection import nearest_neighbors, select_cameras_by_visibility, select_cameras_kcenters
 from .core.writers import write_ply, write_points3D_bin, write_sparse_model_bin
+
+if TYPE_CHECKING:
+    import pycolmap
 
 
 def _voxel_downsample(
@@ -79,6 +80,8 @@ def _voxel_select_track_preserving(
 
 
 def load_reconstruction(sparse_dir: str):
+    import pycolmap
+
     rec = pycolmap.Reconstruction(sparse_dir)
     return rec, rec.cameras, rec.images
 
@@ -260,6 +263,8 @@ def dense_init(
         pack_workers=args.pack_workers,
     )
 
+    from .core.pipeline import PipelineCancelled, run_dense_pipeline
+
     try:
         result = run_dense_pipeline(
             records,
@@ -371,6 +376,8 @@ def dense_init_from_lfs(
     nn_table = nearest_neighbors(flat_poses, effective_nns)
 
     lf.log.info(f"Prepared {len(records)} cameras (refs={len(refs_local)})")
+
+    from .core.pipeline import PipelineCancelled, run_dense_pipeline
 
     try:
         result = run_dense_pipeline(
