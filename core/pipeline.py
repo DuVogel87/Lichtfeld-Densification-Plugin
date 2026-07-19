@@ -773,8 +773,11 @@ def _triangulate_ref(
             if not np.any(valid_uv):
                 continue
 
-            uvA_used = uvA[valid_uv]
-            uvB_used = uvB[valid_uv]
+            idxs = idxs[valid_uv]
+            uvA = uvA[valid_uv]
+            uvB = uvB[valid_uv]
+            uvA_used = uvA
+            uvB_used = uvB
             uvA_cam = uvA_cam[valid_uv]
             uvB_cam = uvB_cam[valid_uv]
             xA_pair = xA_pair[valid_uv]
@@ -782,7 +785,7 @@ def _triangulate_ref(
             xB = xB[valid_uv]
             yB = yB[valid_uv]
             cert_pair = cert_pair[valid_uv]
-            rgb_used = rgb_ref[idxs][valid_uv]
+            rgb_used = rgb_ref[idxs]
 
             Rt1 = Rt_from_Rt(R_by[ref_id], t_by[ref_id])
             Rt2 = Rt_from_Rt(R_by[nbr_id], t_by[nbr_id])
