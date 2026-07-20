@@ -252,6 +252,28 @@ def _npz_chunk_count(path_in: str) -> int:
         return int(data["xyz"].shape[0])
 
 
+def _load_existing_chunk(path_in: str) -> Optional[int]:
+    if not os.path.isfile(path_in):
+        return None
+    try:
+        with np.load(path_in) as data:
+            xyz = data["xyz"]
+            rgb = data["rgb"]
+            if xyz.ndim != 2 or xyz.shape[1] != 3:
+                return None
+            if rgb.ndim != 2 or rgb.shape[1] != 3:
+                return None
+            if rgb.shape[0] != xyz.shape[0]:
+                return None
+            count = int(xyz.shape[0])
+            if count <= 0:
+                return None
+            return count
+    except Exception as exc:
+        lf.log.warn(f"Could not reuse existing chunk {path_in}: {exc}")
+        return None
+
+
 def _write_ply_vertices(file_obj, xyz: np.ndarray, rgb_uint8: np.ndarray) -> None:
     if xyz.shape[0] == 0:
         return
@@ -345,6 +367,7 @@ def _run_dense_pipeline_chunked(
     config: DensePipelineConfig,
     chunk_count: int,
     max_points_per_batch: int,
+    resume_chunks: bool,
     progress_callback: Optional[Callable[[float, str], None]],
     debug_state=None,
     cancel_requested: Optional[Callable[[], bool]] = None,
@@ -367,6 +390,23 @@ def _run_dense_pipeline_chunked(
     chunk_paths: List[str] = []
     chunk_counts: List[int] = []
     for chunk_idx, chunk_refs in enumerate(chunks, start=1):
+        chunk_path = os.path.join(chunk_dir, f"chunk_{chunk_idx:04d}.npz")
+        if resume_chunks:
+            existing_count = _load_existing_chunk(chunk_path)
+            if existing_count is not None:
+                chunk_paths.append(chunk_path)
+                chunk_counts.append(existing_count)
+                lf.log.info(
+                    f"Chunk {chunk_idx}/{len(chunks)} reused "
+                    f"{existing_count:,} points -> {chunk_path}"
+                )
+                if progress_callback:
+                    progress_callback(
+                        5.0 + (chunk_idx / max(1, len(chunks))) * 88.0,
+                        f"Reused chunk {chunk_idx}/{len(chunks)} ({existing_count:,} points)",
+                    )
+                continue
+
         if _cancel_requested(cancel_requested):
             if progress_callback:
                 progress_callback(0.0, "Cancelled")
@@ -432,7 +472,6 @@ def _run_dense_pipeline_chunked(
                 config.seed + chunk_idx,
             )
 
-        chunk_path = os.path.join(chunk_dir, f"chunk_{chunk_idx:04d}.npz")
         count = _save_npz_chunk(chunk_path, xyz, rgb)
         chunk_paths.append(chunk_path)
         chunk_counts.append(count)
@@ -511,6 +550,7 @@ def dense_init(
             config,
             int(args.chunked_batches),
             int(getattr(args, "max_points_per_batch", 0)),
+            bool(getattr(args, "resume_chunks", False)),
             progress_callback=progress_callback,
             debug_state=debug_state,
             cancel_requested=cancel_requested,
@@ -780,6 +820,14 @@ def build_argparser():
         help=(
             "Optional per-chunk point cap before chunk files are merged "
             "(0 = no per-chunk cap; final --max_points still applies globally)."
+        ),
+    )
+    ap.add_argument(
+        "--resume_chunks",
+        action="store_true",
+        help=(
+            "Reuse valid existing chunk_XXXX.npz files in chunked mode and "
+            "continue with the first missing or invalid chunk."
         ),
     )
     ap.add_argument(
