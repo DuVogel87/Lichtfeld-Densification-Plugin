@@ -131,6 +131,8 @@ def _select_reference_indices(
     img_ids: List[int],
     num_refs: int,
 ) -> List[int]:
+    if num_refs >= len(img_ids):
+        return list(range(len(img_ids)))
     idx_map = {iid: i for i, iid in enumerate(img_ids)}
     try:
         refs = select_cameras_by_visibility(rec, num_refs)
